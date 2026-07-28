@@ -174,16 +174,31 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 		}
 
 		uniqueTolerations := controllerconfig.TolerationSet{}
-		hasCephPods := false
+		// Collect tolerations from every ceph pod on the node so that the
+		// node daemons we deploy inherit all the tolerations needed to be
+		// scheduled there (e.g. MDS tolerations still apply to the exporter
+		// when an MDS pod happens to be scheduled on a node owned by this
+		// cluster).
 		for _, cephPod := range cephPods {
 			if cephPod.Spec.NodeName == request.Name {
-				hasCephPods = true
 				for _, podToleration := range cephPod.Spec.Tolerations {
 					// Add toleration to the map
 					uniqueTolerations.Add(podToleration)
 				}
 			}
 		}
+
+		// hasCephPods must reflect "this node is actually managed by the
+		// cluster" rather than "any ceph pod happens to be scheduled here".
+		// MDS (and mds-mirror) pods are excluded because CephFilesystem /
+		// CephFilesystemMirror do not enforce node-affinity by default and
+		// may be scheduled onto nodes that belong to a different
+		// CephCluster in another namespace. Counting those pods as evidence
+		// of cluster ownership would cause duplicate ceph-exporter
+		// deployments to be created on the same node (port 9926 collision),
+		// with one of the exporters being permanently unavailable because
+		// its target cluster has no MON/MGR/OSD on that node.
+		hasCephPods := hasCoreCephPodsOnNode(cephPods, request.Name)
 
 		// Clean up any exporter deployments whose target node no longer exists.
 		// This only needs to run once per operator lifetime: stale deployments
@@ -336,6 +351,33 @@ func (r *ReconcileNode) cephPodList() ([]corev1.Pod, error) {
 	}
 
 	return cephPods, nil
+}
+
+// hasCoreCephPodsOnNode reports whether any pod in the supplied list is a
+// "core" ceph daemon running on the requested node.
+//
+// "Core" means the pod represents that the node is managed by the cluster
+// in a way that warrants node-wide daemons (ceph-exporter / crash
+// collector). MDS and cephfs-mirror pods are intentionally excluded: their
+// owning CRs (CephFilesystem / CephFilesystemMirror) do not enforce
+// node-affinity by default, so they may be scheduled onto nodes that are
+// owned by a different CephCluster in another namespace. Counting them as
+// evidence of cluster ownership would create duplicate ceph-exporter
+// deployments on the same node (port 9926 collision), with the exporter
+// from the non-owning cluster being permanently unavailable because it has
+// no local MON/MGR/OSD daemons to scrape.
+func hasCoreCephPodsOnNode(pods []corev1.Pod, nodeName string) bool {
+	for i := range pods {
+		pod := pods[i]
+		if pod.Spec.NodeName != nodeName {
+			continue
+		}
+		switch pod.Labels[k8sutil.AppAttr] {
+		case mon.AppName, mgr.AppName, osd.AppName, object.AppName, rbd.AppName:
+			return true
+		}
+	}
+	return false
 }
 
 // Delete the daemons and related resources as a best-effort
